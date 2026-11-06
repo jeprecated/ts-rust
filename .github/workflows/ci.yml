@@ -77,7 +77,7 @@ jobs:
       run:
         shell: bash
     env:
-      # One test thread, as goport-tests.sh runs them.
+      # One test thread, as goport-tests.sh runs them (doctests; nextest runs one test per process).
       RUST_TEST_THREADS: 1
     steps:
       # LF in the working tree, as on the other hosts: Git for Windows sets core.autocrlf=true, which
@@ -132,20 +132,29 @@ jobs:
         run: |
           cargo test --release --locked --workspace --no-run
           cargo test --release --locked -p ts_goport --test go_baselines --no-run
+      # nextest runs each test in its own process, several at once, instead of one serial thread:
+      # about half the time on 4 vCPU, with the same tests and results (ci-speed, 2026-11-06).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Unit and integration tests
-        run: cargo test --release --locked --workspace --no-fail-fast
+        run: cargo nextest run --release --locked --workspace --no-fail-fast
+      # nextest does not run doctests.
+      - name: Doctests
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked --workspace --doc
       # go_baselines has `test = false`, so --workspace skips it. TestLocal (about 12,700 compiler
       # cases) runs in 4 shards in goport-tests.sh, in the revision pipeline; the rest of the default
       # go_baselines set runs here, also after a failed unit test.
       - name: Go baselines
         if: ${{ !cancelled() }}
         run: |
-          skip=(--skip compiler_runner::test_local)
+          filter='not test(compiler_runner::test_local)'
           # Open on macOS: the 10 tests of project_lsp/resolveahead_test.rs (resolveahead1, merged
           # after the macOS port) have never passed there. 9 find no resolve-ahead load and 1 finds
           # no configured project. They pass on Linux.
-          [[ $RUNNER_OS != macOS ]] || skip+=(--skip project_lsp::resolveahead_test::)
-          cargo test --release --locked --no-fail-fast -p ts_goport --test go_baselines -- "${skip[@]}"
+          [[ $RUNNER_OS != macOS ]] || filter+=' and not test(project_lsp::resolveahead_test::)'
+          cargo nextest run --release --locked --no-fail-fast -p ts_goport --test go_baselines -E "$filter"
       # Windows: the tsc against Go's tsc on Windows path forms, CRLF sources and a junction
       # (scripts/goport/win-go-compare.sh). Go's tsc builds from the pinned Go source with the pin's
       # Go (oracle.go), as the oracle does; both embed the lib files.
