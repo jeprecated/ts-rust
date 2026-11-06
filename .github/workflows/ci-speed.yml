@@ -1,0 +1,204 @@
+# ci-speed benchmark, wave 4: combinations (nextest, -Zthreads, arm64, golden vs rust-cache), 2 replicas (jeprecated/ts-rust fork only; never upstream).
+# `test` copies upstream ci.yml's test job on Linux x64 (GitHub-hosted instead of Blacksmith),
+# `lint` copies its lint job. Only the matrix fields vary. PHASE comes from
+# .github/ci-speed/phase: `seed` saves caches, `measure` only restores them.
+name: ci-speed
+
+on:
+  push:
+    branches: ["ci-speed/**"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -C debuginfo=0
+  RUSTUP_TOOLCHAIN: 1.95.0
+
+jobs:
+  lint:
+    name: "lint ${{ matrix.v.id }} r${{ matrix.rep }}"
+    runs-on: ${{ matrix.v.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        v:
+          - { id: base-rc, runner: ubuntu-latest, cache: rc }
+          - { id: arm-rc, runner: ubuntu-24.04-arm, cache: rc }
+        rep: [1, 2]
+    env:
+      VARIANT: lint-${{ matrix.v.id }}
+      CACHE: ${{ matrix.v.cache }}
+      LINKER: ${{ matrix.v.linker || 'default' }}
+      WRAPPER: ${{ matrix.v.wrapper || 'none' }}
+      EXTRA_ENV: ${{ matrix.v.env || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 20
+      - name: bench info
+        id: phase
+        run: |
+          echo "phase=$(cat .github/ci-speed/phase)" >> "$GITHUB_OUTPUT"
+          bash .github/ci-speed/variant.sh info
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal -c rustfmt,clippy
+      - if: matrix.v.cache == 'rc'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint-${{ matrix.v.id }}
+          save-if: ${{ steps.phase.outputs.phase == 'seed' }}
+          cache-on-failure: true
+      - name: variant tools
+        run: bash .github/ci-speed/variant.sh tools
+      - run: cargo fmt --all -- --check
+      - name: Generated AST files match the codegen
+        run: |
+          cargo run --locked --quiet -p ts_ast_codegen -- check crates/ts_goport/src/astdata/syntax_kind.rs
+          cargo run --locked --quiet -p ts_ast_codegen -- check-ast crates/ts_goport/src/astdata/ast_generated.rs
+      - run: cargo clippy --locked -p ts_goport -p goport_core -p goport_util -p goport_lsproto --all-targets --timings -- -D warnings
+      - name: bench record
+        if: always()
+        run: bash .github/ci-speed/variant.sh record
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-lint-${{ matrix.v.id }}-r${{ matrix.rep }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bench
+          retention-days: 30
+
+  test:
+    name: "test ${{ matrix.v.id }} r${{ matrix.rep }}"
+    runs-on: ${{ matrix.v.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        v:
+          - { id: golden, runner: ubuntu-latest, cache: golden }
+          - { id: golden-nextest-zthreads, runner: ubuntu-latest, cache: golden, tests: nextest, wrapper: zthreads }
+          - { id: rc-nextest, runner: ubuntu-latest, cache: rc, tests: nextest }
+          - { id: arm-golden-nextest, runner: ubuntu-24.04-arm, cache: golden, tests: nextest }
+        rep: [1, 2]
+    env:
+      RUST_TEST_THREADS: 1
+      VARIANT: ${{ matrix.v.id }}
+      CACHE: ${{ matrix.v.cache }}
+      LINKER: ${{ matrix.v.linker || 'default' }}
+      WRAPPER: ${{ matrix.v.wrapper || 'none' }}
+      EXTRA_ENV: ${{ matrix.v.env || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 20
+      - name: bench info
+        id: phase
+        run: |
+          echo "phase=$(cat .github/ci-speed/phase)" >> "$GITHUB_OUTPUT"
+          bash .github/ci-speed/variant.sh info
+      - name: Resolve the Go pin
+        id: pin
+        run: |
+          key=$(jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/current.json)
+          python3 scripts/upstream/pin.py show ${key:+"$key"} > "$RUNNER_TEMP/pin.json"
+          jq -r '"repo=\(.repo)", "commit=\(.commit)", "subdir=\(.subdir // "")"' "$RUNNER_TEMP/pin.json" >> "$GITHUB_OUTPUT"
+      - name: Check out the pinned Go source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ steps.pin.outputs.repo }}
+          ref: ${{ steps.pin.outputs.commit }}
+          path: go-pin
+          sparse-checkout: ${{ steps.pin.outputs.subdir }}
+          persist-credentials: false
+      - name: Set the test paths
+        run: |
+          echo "TS_GO_REPO=$GITHUB_WORKSPACE/go-pin${SUBDIR:+/$SUBDIR}" >> "$GITHUB_ENV"
+          echo "TSCTEST_TMP=$RUNNER_TEMP/tsctest" >> "$GITHUB_ENV"
+          echo "COMPILER_RUNNER_TMP=$RUNNER_TEMP/compiler-runner" >> "$GITHUB_ENV"
+        env:
+          SUBDIR: ${{ steps.pin.outputs.subdir }}
+      - name: Install the Go repo's typescript package
+        run: |
+          url=$(jq -r '.packages["node_modules/typescript"].resolved' go-pin/package-lock.json)
+          mkdir -p go-pin/node_modules/typescript
+          curl -sSfL "$url" | tar xz -C go-pin/node_modules/typescript --strip-components=1
+          jq -r .version go-pin/node_modules/typescript/package.json
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - if: matrix.v.cache == 'rc'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.v.id }}
+          save-if: ${{ steps.phase.outputs.phase == 'seed' }}
+          cache-on-failure: true
+      - if: matrix.v.cache == 'golden'
+        name: restore golden target
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: golden-${{ matrix.v.id }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ github.sha }}
+          restore-keys: golden-${{ matrix.v.id }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-
+      - if: matrix.v.cache == 'golden'
+        name: golden mtimes
+        run: bash .github/ci-speed/variant.sh mtime
+      - name: variant tools
+        run: bash .github/ci-speed/variant.sh tools
+      - name: Build
+        id: build
+        run: |
+          cargo test --release --locked --workspace --no-run --timings
+          cargo test --release --locked -p ts_goport --test go_baselines --no-run
+      - if: matrix.v.tests == 'nextest'
+        uses: taiki-e/install-action@nextest
+      # nextest variant: one process per test, run in parallel (RUST_TEST_THREADS does not apply);
+      # doctests separately, since nextest does not run them.
+      - name: Unit and integration tests
+        run: |
+          if [[ "${{ matrix.v.tests }}" == nextest ]]; then
+            rc=0
+            cargo nextest run --release --locked --workspace --no-fail-fast || rc=$?
+            cargo test --release --locked --workspace --doc || rc=$?
+            exit $rc
+          else
+            cargo test --release --locked --workspace --no-fail-fast
+          fi
+      - name: Go baselines
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ "${{ matrix.v.tests }}" == nextest ]]; then
+            cargo nextest run --release --locked --no-fail-fast -p ts_goport --test go_baselines -E 'not test(compiler_runner::test_local)'
+          else
+            cargo test --release --locked --no-fail-fast -p ts_goport --test go_baselines -- --skip compiler_runner::test_local
+          fi
+      - name: bench record
+        if: always()
+        run: bash .github/ci-speed/variant.sh record
+      - if: always() && matrix.v.cache == 'golden' && steps.phase.outputs.phase == 'seed' && steps.build.outcome == 'success'
+        run: git rev-parse HEAD > target/.golden-sha
+      - if: always() && matrix.v.cache == 'golden' && steps.phase.outputs.phase == 'seed' && steps.build.outcome == 'success'
+        name: save golden target
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: golden-${{ matrix.v.id }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-test-${{ matrix.v.id }}-r${{ matrix.rep }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bench
+          retention-days: 30
